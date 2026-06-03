@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# Local config that may end up in checkouts during dev
+.vaultctx
+
+# macOS
+.DS_Store

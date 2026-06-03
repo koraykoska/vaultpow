@@ -1,0 +1,196 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Don't ship a release that doesn't pass CI.
+  test:
+    name: Pre-release tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked --all-targets
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.runs_on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runs_on: ubuntu-latest
+            asset_name: vaultpow-linux-amd64
+            use_cross: false
+          - target: aarch64-unknown-linux-gnu
+            runs_on: ubuntu-latest
+            asset_name: vaultpow-linux-arm64
+            use_cross: true
+          - target: aarch64-apple-darwin
+            # macos-14 is Apple Silicon (arm64) — no cross-compile needed.
+            runs_on: macos-14
+            asset_name: vaultpow-macos-arm64
+            use_cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build (cargo)
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage tarball
+        id: stage
+        run: |
+          set -euo pipefail
+          STAGE="${RUNNER_TEMP}/stage"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/vaultpow" "$STAGE/vaultpow"
+          # Ship the shell snippets too — they're embedded in the binary
+          # via include_str! so they aren't strictly required at runtime,
+          # but bundling them lets users inspect or source them directly.
+          mkdir -p "$STAGE/shell"
+          cp shell/zsh-init.sh shell/bash-init.sh "$STAGE/shell/"
+          cp README.md LICENSE "$STAGE/"
+          cd "$STAGE"
+          TARBALL="${{ matrix.asset_name }}.tar.gz"
+          tar -czf "../$TARBALL" .
+          cd ..
+          # Compute SHA256 in a portable way (BSD vs GNU shasum).
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+          else
+            sha256sum "$TARBALL" > "$TARBALL.sha256"
+          fi
+          echo "tarball=${RUNNER_TEMP}/$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "sha256=${RUNNER_TEMP}/$TARBALL.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: |
+            ${{ steps.stage.outputs.tarball }}
+            ${{ steps.stage.outputs.sha256 }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact tree
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.sha256' \) \
+            -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+
+  # Bump Formula/vaultpow.rb on main with the new version + sha256s so
+  # `brew upgrade vaultpow` picks up the release. Tag-triggered workflow
+  # is detached, so we explicitly check out main and push there.
+  update-formula:
+    name: Bump Homebrew formula on main
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      # GITHUB_TOKEN with contents:write can push to the same repo. Branch
+      # protection on main may block this — if so, switch to a deploy key
+      # or PAT, or change to a PR-based flow with peter-evans/create-pull-request.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          # Default token is sufficient for pushing to the same repo when
+          # branch protection isn't enabled on main.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download sha256 sidecars
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Bump formula
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF#refs/tags/v}"
+
+          # Each artifact upload is a directory of the asset_name; the
+          # .sha256 sidecar inside is in `<sha>  <filename>` format.
+          MACOS_ARM64_SHA="$(awk '{print $1}' artifacts/vaultpow-macos-arm64/vaultpow-macos-arm64.tar.gz.sha256)"
+          LINUX_AMD64_SHA="$(awk '{print $1}' artifacts/vaultpow-linux-amd64/vaultpow-linux-amd64.tar.gz.sha256)"
+          LINUX_ARM64_SHA="$(awk '{print $1}' artifacts/vaultpow-linux-arm64/vaultpow-linux-arm64.tar.gz.sha256)"
+
+          ./scripts/update-formula.sh \
+            "$VERSION" \
+            "$MACOS_ARM64_SHA" \
+            "$LINUX_AMD64_SHA" \
+            "$LINUX_ARM64_SHA"
+
+      - name: Commit & push
+        run: |
+          set -euo pipefail
+          # No-op if nothing changed (e.g. re-run on the same tag).
+          if git diff --quiet -- Formula/vaultpow.rb; then
+            echo "Formula already up to date — nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/vaultpow.rb
+          git commit -m "release: bump Homebrew formula to v${GITHUB_REF#refs/tags/v}
+
+          [skip ci]"
+          git push origin HEAD:main

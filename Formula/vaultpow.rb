@@ -29,18 +29,18 @@ class Vaultpow < Formula
   on_macos do
     on_arm do
       url "https://github.com/koraykoska/vaultpow/releases/download/v#{version}/vaultpow-macos-arm64.tar.gz"
-      sha256 "REPLACE_WITH_SHA256_OF_MACOS_ARM64_TARBALL" # bump:macos-arm64
+      sha256 "02b4738ea16853557d09d3625024520d65af26be94c97db8215a99c10a601776" # bump:macos-arm64
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/koraykoska/vaultpow/releases/download/v#{version}/vaultpow-linux-amd64.tar.gz"
-      sha256 "REPLACE_WITH_SHA256_OF_LINUX_AMD64_TARBALL" # bump:linux-amd64
+      sha256 "b5976e774cada48fb0636ff3b27ceae7208d4628e8fde2c6f4c838e877412895" # bump:linux-amd64
     end
     on_arm do
       url "https://github.com/koraykoska/vaultpow/releases/download/v#{version}/vaultpow-linux-arm64.tar.gz"
-      sha256 "REPLACE_WITH_SHA256_OF_LINUX_ARM64_TARBALL" # bump:linux-arm64
+      sha256 "e69134ebeb29a8655a8e113f71c81d70a164586905b3e7c1502bc2030bf70939" # bump:linux-arm64
     end
   end
 

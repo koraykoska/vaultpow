@@ -44,12 +44,12 @@ class Vaultpow < Formula
     end
   end
 
-  # Either `vault` or `bao` is required for interactive logins (OIDC,
-  # userpass) and for namespace management. They're interchangeable;
-  # vaultpow picks whichever is on PATH (override with VAULTPOW_VAULT_BIN).
-  # Listed as recommended (not required) because token probes/renewals go
-  # through HTTP directly and don't need either CLI.
-  depends_on "vault" => :recommended
+  # No `depends_on` for `vault`/`bao`: neither is in Homebrew core, and
+  # both live in separate taps (`hashicorp/tap` and `openbao/tap`) that
+  # we don't want to force users to add. vaultpow's token probes and
+  # renewals go through HTTP directly — the only paths that need a real
+  # CLI are interactive logins (OIDC, userpass) and namespace management,
+  # and the caveats below tell users how to get one when they need it.
 
   def install
     bin.install "vaultpow"
@@ -86,6 +86,17 @@ class Vaultpow < Formula
         vaultpow add-cluster
         vaultpow auth
         vault kv get secret/foo     # or: bao kv get secret/foo
+
+      Note: vaultpow itself has no runtime dependencies — token probes
+      and renewals go through HTTP directly. The `vault` / `bao` CLI is
+      only needed for interactive logins (OIDC, userpass) and namespace
+      management. Install one when you need it:
+
+        brew tap   hashicorp/tap
+        brew install hashicorp/tap/vault
+
+      OpenBao (https://openbao.org/docs/install/) is wire-compatible
+      and works as a drop-in replacement.
     EOS
   end
 

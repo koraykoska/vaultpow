@@ -107,8 +107,8 @@ pub struct Auth {
     pub method: Option<String>,
 
     /// Method-specific parameters. Conventional keys:
-    ///   - oidc:     `role`
-    ///   - userpass: `username`
+    ///   - oidc:     `path` (mount path; default `oidc`), `role`
+    ///   - userpass: `path` (mount path; default `userpass`), `username`
     ///   - other:    `args` (the literal whitespace-separated extra args)
     ///
     /// New methods can add keys without a schema migration.
@@ -424,6 +424,57 @@ mod tests {
             fs::write(path, "").unwrap();
             let cfg = load().expect("load empty");
             assert!(cfg.clusters.is_empty());
+        });
+    }
+
+    #[test]
+    fn auth_params_round_trip_path_role_and_username() {
+        // Regression: when the user uses a custom OIDC mount path or stores
+        // a userpass username, those must survive a save/load cycle so
+        // refreshes don't re-prompt.
+        with_temp_config(|_| {
+            let mut cfg = Config::default();
+            let mut cluster = Cluster {
+                name: "c".into(),
+                server: "http://x".into(),
+                ..Default::default()
+            };
+            cluster
+                .add_auth(Auth {
+                    name: "google".into(),
+                    method: Some("oidc".into()),
+                    params: BTreeMap::from([
+                        ("path".into(), "google".into()),
+                        ("role".into(), "admin".into()),
+                    ]),
+                    token: Some("hvs.x".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            cluster
+                .add_auth(Auth {
+                    name: "ro".into(),
+                    method: Some("userpass".into()),
+                    params: BTreeMap::from([
+                        ("path".into(), "corp-ldap".into()),
+                        ("username".into(), "alice".into()),
+                    ]),
+                    ..Default::default()
+                })
+                .unwrap();
+            cluster.current_auth = "google".into();
+            cfg.clusters.push(cluster);
+            cfg.current_cluster = "c".into();
+            save(&cfg).unwrap();
+
+            let loaded = load().unwrap();
+            let oidc = loaded.cluster("c").unwrap().auth("google").unwrap();
+            assert_eq!(oidc.params.get("path").map(|s| s.as_str()), Some("google"));
+            assert_eq!(oidc.params.get("role").map(|s| s.as_str()), Some("admin"));
+
+            let up = loaded.cluster("c").unwrap().auth("ro").unwrap();
+            assert_eq!(up.params.get("path").map(|s| s.as_str()), Some("corp-ldap"));
+            assert_eq!(up.params.get("username").map(|s| s.as_str()), Some("alice"));
         });
     }
 

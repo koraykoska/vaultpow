@@ -266,6 +266,7 @@ pub enum AuthCommand {
     ///     vaultpow auth add                                      (interactive)
     ///     vaultpow auth add --name admin --method oidc --role admin --non-interactive
     ///     vaultpow auth add --name ro --method userpass --username alice
+    ///     vaultpow auth add --name google --method oidc --path google --role admin
     Add {
         /// Name for this auth profile (defaults to the method if omitted).
         #[arg(long)]
@@ -274,6 +275,15 @@ pub enum AuthCommand {
         /// Auth method. Supported: token, userpass, oidc, other.
         #[arg(long, value_parser = ["token", "userpass", "oidc", "other"])]
         method: Option<String>,
+
+        /// Vault mount path for the auth method (only for OIDC/userpass).
+        ///
+        /// Defaults to the method name (`oidc`, `userpass`) — the Vault
+        /// default mount. Set this when your operator mounted the method
+        /// at a custom path like `google`, `corp-sso`, etc. Translates to
+        /// `-path=<value>` on the underlying `vault login` / `bao login`.
+        #[arg(long)]
+        path: Option<String>,
 
         /// OIDC role (only meaningful with --method=oidc).
         #[arg(long)]

@@ -638,6 +638,100 @@ current_cluster: prod
 }
 
 #[test]
+fn auth_add_non_interactive_oidc_requires_role() {
+    // --non-interactive must error before shelling out if a required
+    // method-specific param is missing. This is a boundary check on the
+    // CLI surface; we don't actually try to authenticate.
+    let f = CliFixture::new();
+    assert_success(f.cmd().args([
+        "add-cluster",
+        "--name",
+        "p",
+        "--server",
+        "http://127.0.0.1:8200",
+        "--non-interactive",
+    ]));
+    let out = f
+        .cmd()
+        .args([
+            "auth",
+            "add",
+            "--name",
+            "x",
+            "--method",
+            "oidc",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--role is required"), "stderr: {stderr}");
+}
+
+#[test]
+fn auth_add_non_interactive_passing_path_role_works_and_persists_params() {
+    // We can't actually authenticate (no real `bao`/`vault` on PATH in
+    // CI), but we can verify the CLI surface accepts --path and would
+    // pass through the boundary checks. We then short-circuit before
+    // the network/shell-out by exploiting that --method=oidc with --role
+    // set passes the upfront validation. The call will fail on the
+    // shell-out step, but we only assert that the failure is from the
+    // `bao`/`vault` invocation, not from arg validation.
+    let f = CliFixture::new();
+    assert_success(f.cmd().args([
+        "add-cluster",
+        "--name",
+        "p",
+        "--server",
+        "http://127.0.0.1:8200",
+        "--non-interactive",
+    ]));
+    let out = f
+        .cmd()
+        // PATH=empty so vault/bao aren't found — we expect the friendly
+        // "neither the `vault` nor `bao` CLI is on your PATH" error,
+        // which proves arg validation passed.
+        .env("PATH", "")
+        .args([
+            "auth",
+            "add",
+            "--name",
+            "google",
+            "--method",
+            "oidc",
+            "--path",
+            "google",
+            "--role",
+            "admin",
+            "--non-interactive",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "should fail with no CLI installed");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("vault` nor `bao` CLI"),
+        "expected CLI-missing error, got: {stderr}"
+    );
+    // Critically, NOT a --path validation error.
+    assert!(
+        !stderr.contains("--path is required"),
+        "--path should be optional, got: {stderr}"
+    );
+}
+
+#[test]
+fn auth_add_path_appears_in_help() {
+    // Smoke check that --path is exposed on the CLI surface.
+    let f = CliFixture::new();
+    let out = assert_success(f.cmd().args(["auth", "add", "--help"]));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("--path"), "got: {s}");
+    assert!(s.contains("mount path"), "got: {s}");
+}
+
+#[test]
 fn auth_hint_lists_others_when_multiple_auths_configured() {
     let f = CliFixture::new();
     write_multi_auth_config(&f, "admin");

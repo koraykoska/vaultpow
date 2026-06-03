@@ -55,10 +55,11 @@ fn run(cli: Cli) -> Result<ExitCode> {
             Some(AuthCommand::Add {
                 name,
                 method,
+                path,
                 role,
                 username,
                 non_interactive,
-            }) => commands::auth::add(name, method, role, username, non_interactive)
+            }) => commands::auth::add(name, method, path, role, username, non_interactive)
                 .map(|_| ExitCode::SUCCESS),
             Some(AuthCommand::Rm { name }) => commands::auth::rm(name).map(|_| ExitCode::SUCCESS),
             Some(AuthCommand::Hint) => commands::auth::hint().map(|_| ExitCode::SUCCESS),

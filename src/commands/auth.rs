@@ -4,7 +4,10 @@
 //   - refresh(method)       — re-auth the cluster's current named auth
 //   - list()                — list named auths for current cluster
 //   - use_auth(name)        — switch current_auth (no re-auth)
-//   - add(name, method, role, username, non_interactive) — create + auth a new named entry
+//   - add(name, method, path, role, username, non_interactive)
+//                           — create + auth a new named entry; `path` overrides
+//                             the default Vault mount path for OIDC/userpass
+//                             when the operator mounted them at a custom name
 //   - rm(name)              — delete a named auth (never auto-pick a replacement)
 //
 // Why named auths: a single Vault/OpenBao cluster commonly hosts several
@@ -39,7 +42,7 @@ pub fn refresh(method_override: Option<String>) -> Result<()> {
             crate::commands::info(format!(
                 "no auths configured for '{cluster_name}' — adding one now"
             ));
-            return add(None, method_override, None, None, false);
+            return add(None, method_override, None, None, None, false);
         }
         return Err(anyhow!(
             "no current auth selected for '{cluster_name}'.\n\nAvailable: {}\nPick one with `vaultpow auth use <name>` or add a new one with\n`vaultpow auth add`.",
@@ -149,6 +152,7 @@ pub fn use_auth(name: String) -> Result<()> {
 pub fn add(
     name: Option<String>,
     method: Option<String>,
+    path: Option<String>,
     role: Option<String>,
     username: Option<String>,
     non_interactive: bool,
@@ -185,18 +189,31 @@ pub fn add(
     }
 
     // Build a stub Auth carrying the params the user passed; run_method
-    // reads `role`/`username` out of params for OIDC/userpass.
+    // reads `path`/`role`/`username` out of params for OIDC/userpass.
     let mut stub = Auth {
         name: name.clone(),
         method: Some(method.clone()),
         ..Default::default()
     };
-    if let Some(r) = role.clone() {
+    if let Some(p) = path.clone().filter(|p| !p.is_empty()) {
+        stub.params.insert("path".into(), p);
+    }
+    if let Some(r) = role.clone().filter(|r| !r.is_empty()) {
         stub.params.insert("role".into(), r);
     }
-    if let Some(u) = username.clone() {
+    if let Some(u) = username.clone().filter(|u| !u.is_empty()) {
         stub.params.insert("username".into(), u);
     }
+
+    // Interactive: prompt for OIDC/userpass-specific params the user didn't
+    // pass via flags. Path is the only one truly needed when the operator
+    // mounted the method at a non-default location (e.g. -path=google for a
+    // Google OIDC integration). Role/username can be left blank to use
+    // server-side defaults.
+    if !non_interactive {
+        prompt_method_params(&method, &mut stub.params)?;
+    }
+
     if matches!(method.as_str(), "oidc" | "userpass") && non_interactive {
         // Sanity-check method-specific args at the boundary so the user gets
         // a clear error before we shell out and waste their time.
@@ -326,19 +343,23 @@ fn run_method(method: &str, cluster: &Cluster, auth: &Auth) -> Result<String> {
                     .map_err(|e| anyhow!("prompt failed: {e}"))?,
             };
             let pass = rpassword::prompt_password("Password: ").context("reading password")?;
-            run_vault_login(
-                server,
-                namespace,
-                &[
-                    "-method=userpass",
-                    "-token-only",
-                    &format!("username={user}"),
-                    &format!("password={pass}"),
-                ],
-            )
+            let mut args: Vec<String> = vec!["-method=userpass".into(), "-token-only".into()];
+            if let Some(p) = auth.params.get("path").filter(|p| !p.is_empty()) {
+                args.push(format!("-path={p}"));
+            }
+            args.push(format!("username={user}"));
+            args.push(format!("password={pass}"));
+            let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            run_vault_login(server, namespace, &argv)
         }
         "oidc" => {
             let mut args: Vec<String> = vec!["-method=oidc".into(), "-token-only".into()];
+            // Custom mount path (e.g. `-path=google` when OIDC is mounted at
+            // `auth/google/` instead of `auth/oidc/`). Vault's `bao login`
+            // expects this *before* any method-specific kv pairs.
+            if let Some(p) = auth.params.get("path").filter(|p| !p.is_empty()) {
+                args.push(format!("-path={p}"));
+            }
             if let Some(role) = auth.params.get("role").filter(|r| !r.is_empty()) {
                 args.push(format!("role={role}"));
             }
@@ -364,6 +385,56 @@ fn run_method(method: &str, cluster: &Cluster, auth: &Auth) -> Result<String> {
             "unknown auth method '{other}' (valid: token, userpass, oidc, other)"
         )),
     }
+}
+
+/// Interactive prompts for method-specific params that haven't been provided
+/// via flags. Only prompts for things that meaningfully differ between
+/// installs (custom mount path, OIDC role); username is left to run_method
+/// because it pairs naturally with the password prompt.
+fn prompt_method_params(
+    method: &str,
+    params: &mut std::collections::BTreeMap<String, String>,
+) -> Result<()> {
+    match method {
+        "oidc" => {
+            if !params.contains_key("path") {
+                let p: String = Input::new()
+                    .with_prompt("OIDC mount path (blank = default `oidc`)")
+                    .allow_empty(true)
+                    .interact_text()
+                    .map_err(|e| anyhow!("prompt failed: {e}"))?;
+                if !p.trim().is_empty() {
+                    params.insert("path".into(), p.trim().to_string());
+                }
+            }
+            if !params.contains_key("role") {
+                let r: String = Input::new()
+                    .with_prompt("OIDC role (blank = server default)")
+                    .allow_empty(true)
+                    .interact_text()
+                    .map_err(|e| anyhow!("prompt failed: {e}"))?;
+                if !r.trim().is_empty() {
+                    params.insert("role".into(), r.trim().to_string());
+                }
+            }
+        }
+        "userpass" => {
+            if !params.contains_key("path") {
+                let p: String = Input::new()
+                    .with_prompt("userpass mount path (blank = default `userpass`)")
+                    .allow_empty(true)
+                    .interact_text()
+                    .map_err(|e| anyhow!("prompt failed: {e}"))?;
+                if !p.trim().is_empty() {
+                    params.insert("path".into(), p.trim().to_string());
+                }
+            }
+            // Username + password are prompted together inside `run_method`
+            // since they pair naturally and the password isn't stored anyway.
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn make_probe_cluster(cluster: &Cluster, token: &str) -> Cluster {

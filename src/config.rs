@@ -115,6 +115,18 @@ pub struct Auth {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, String>,
 
+    /// Namespaces this auth is valid for. Vault tokens are typically
+    /// scoped to a single namespace (or a small set), so we track that
+    /// per-auth and let `vaultpow ns <name>` switch auths when the
+    /// requested namespace isn't covered by the current one.
+    ///
+    /// Empty list = *unscoped* (treats this auth as supporting any
+    /// namespace). That's the default for auths created before this
+    /// field existed, preserving backward compatibility — only the user
+    /// opting into per-namespace tagging gets the auth-switching flow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub namespaces: Vec<String>,
+
     /// The Vault/OpenBao token. Stored in plaintext at rest (file is mode 0600).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
@@ -273,6 +285,16 @@ impl Config {
     }
 }
 
+impl Auth {
+    /// True if this auth claims to support `ns`. An auth with an empty
+    /// `namespaces` list is considered *unscoped* (matches any namespace),
+    /// matching the behaviour of the pre-namespace-aware schema so that
+    /// configs without per-auth tagging continue to work unchanged.
+    pub fn supports_namespace(&self, ns: &str) -> bool {
+        self.namespaces.is_empty() || self.namespaces.iter().any(|n| n == ns)
+    }
+}
+
 impl Cluster {
     /// Look up a named auth on this cluster.
     pub fn auth(&self, name: &str) -> Option<&Auth> {
@@ -303,6 +325,17 @@ impl Cluster {
         }
         let name = self.current_auth.clone();
         self.auth_mut(&name)
+    }
+
+    /// All auths on this cluster that claim to support `ns`. See
+    /// [`Auth::supports_namespace`] for the matching rule (empty list
+    /// counts as unscoped). Returned in declaration order so prompts are
+    /// stable across invocations.
+    pub fn auths_supporting_namespace(&self, ns: &str) -> Vec<&Auth> {
+        self.auths
+            .iter()
+            .filter(|a| a.supports_namespace(ns))
+            .collect()
     }
 
     /// Add a named auth. Errors if the name is empty or already exists.
@@ -363,6 +396,10 @@ impl Cluster {
             name: "default".into(),
             method: None,
             params: BTreeMap::new(),
+            // Migrated auths start unscoped; the v0.1 schema didn't track
+            // namespaces per-auth, so we can't infer what they were and
+            // unscoped preserves the user's existing behaviour.
+            namespaces: Vec::new(),
             token: legacy.token,
             expire_time: legacy.expire_time,
             creation_time: legacy.creation_time,
@@ -424,6 +461,134 @@ mod tests {
             fs::write(path, "").unwrap();
             let cfg = load().expect("load empty");
             assert!(cfg.clusters.is_empty());
+        });
+    }
+
+    #[test]
+    fn auth_supports_namespace_when_unscoped_or_listed() {
+        // Empty namespaces list = unscoped = matches everything. That's
+        // the v0.2 backward-compat default: existing auths without the
+        // new field stay usable across all namespaces.
+        let unscoped = Auth {
+            name: "u".into(),
+            ..Default::default()
+        };
+        assert!(unscoped.supports_namespace("admin/team-a"));
+        assert!(unscoped.supports_namespace(""));
+        assert!(unscoped.supports_namespace("anything"));
+
+        let scoped = Auth {
+            name: "s".into(),
+            namespaces: vec!["admin/team-a".into(), "admin/shared".into()],
+            ..Default::default()
+        };
+        assert!(scoped.supports_namespace("admin/team-a"));
+        assert!(scoped.supports_namespace("admin/shared"));
+        assert!(!scoped.supports_namespace("admin/team-b"));
+        assert!(!scoped.supports_namespace(""));
+    }
+
+    #[test]
+    fn auths_supporting_namespace_returns_candidates_in_declaration_order() {
+        let mut cluster = Cluster {
+            name: "c".into(),
+            server: "http://x".into(),
+            ..Default::default()
+        };
+        cluster
+            .add_auth(Auth {
+                name: "admin".into(),
+                namespaces: vec!["admin/team-a".into()],
+                ..Default::default()
+            })
+            .unwrap();
+        cluster
+            .add_auth(Auth {
+                name: "everywhere".into(),
+                // Empty = unscoped: matches any namespace.
+                ..Default::default()
+            })
+            .unwrap();
+        cluster
+            .add_auth(Auth {
+                name: "ro".into(),
+                namespaces: vec!["admin/team-a".into(), "admin/public".into()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let admin_a = cluster.auths_supporting_namespace("admin/team-a");
+        assert_eq!(
+            admin_a.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["admin", "everywhere", "ro"]
+        );
+
+        let other = cluster.auths_supporting_namespace("admin/team-b");
+        assert_eq!(
+            other.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+            vec!["everywhere"]
+        );
+
+        let nope = Cluster {
+            name: "c2".into(),
+            server: "http://x".into(),
+            auths: vec![Auth {
+                name: "only-a".into(),
+                namespaces: vec!["admin/a".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(nope.auths_supporting_namespace("admin/b").is_empty());
+    }
+
+    #[test]
+    fn auth_namespaces_round_trip_through_yaml() {
+        with_temp_config(|_| {
+            let mut cfg = Config::default();
+            let mut cluster = Cluster {
+                name: "c".into(),
+                server: "http://x".into(),
+                ..Default::default()
+            };
+            cluster
+                .add_auth(Auth {
+                    name: "admin".into(),
+                    namespaces: vec!["admin/team-a".into(), "admin/shared".into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            cluster.current_auth = "admin".into();
+            cfg.clusters.push(cluster);
+            cfg.current_cluster = "c".into();
+            save(&cfg).unwrap();
+
+            let loaded = load().unwrap();
+            let a = loaded.cluster("c").unwrap().auth("admin").unwrap();
+            assert_eq!(a.namespaces, vec!["admin/team-a", "admin/shared"]);
+        });
+    }
+
+    #[test]
+    fn legacy_v02_auth_without_namespaces_field_is_unscoped() {
+        // Auths serialised before namespaces existed don't carry the
+        // field; serde defaults it to empty. They must remain treated as
+        // unscoped (matching everything) so existing setups don't break.
+        with_temp_config(|path| {
+            let yaml = r#"clusters:
+- name: c
+  server: http://x
+  auths:
+    - name: legacy
+      token: hvs.x
+  current_auth: legacy
+current_cluster: c
+"#;
+            fs::write(path, yaml).unwrap();
+            let cfg = load().unwrap();
+            let a = cfg.cluster("c").unwrap().auth("legacy").unwrap();
+            assert!(a.namespaces.is_empty());
+            assert!(a.supports_namespace("anywhere"));
         });
     }
 
@@ -493,6 +658,7 @@ mod tests {
                     name: "admin".into(),
                     method: Some("oidc".into()),
                     params: BTreeMap::from([("role".into(), "admin".into())]),
+                    namespaces: vec![],
                     token: Some("hvs.AAAA".into()),
                     expire_time: Some("2030-01-01T00:00:00Z".into()),
                     creation_time: Some(1_700_000_000),

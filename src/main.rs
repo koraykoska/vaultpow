@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use anyhow::Result;
 use clap::Parser;
 
-use crate::cli::{AuthCommand, Cli, Command, NsCommand};
+use crate::cli::{AuthCommand, AuthNsCommand, Cli, Command, NsCommand};
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -58,10 +58,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 path,
                 role,
                 username,
+                namespaces,
                 non_interactive,
-            }) => commands::auth::add(name, method, path, role, username, non_interactive)
-                .map(|_| ExitCode::SUCCESS),
+            }) => commands::auth::add(
+                name,
+                method,
+                path,
+                role,
+                username,
+                namespaces,
+                non_interactive,
+            )
+            .map(|_| ExitCode::SUCCESS),
             Some(AuthCommand::Rm { name }) => commands::auth::rm(name).map(|_| ExitCode::SUCCESS),
+            Some(AuthCommand::Ns { action }) => match action {
+                None | Some(AuthNsCommand::List) => {
+                    commands::auth::ns_list().map(|_| ExitCode::SUCCESS)
+                }
+                Some(AuthNsCommand::Add { name }) => {
+                    commands::auth::ns_add(name).map(|_| ExitCode::SUCCESS)
+                }
+                Some(AuthNsCommand::Rm { name }) => {
+                    commands::auth::ns_rm(name).map(|_| ExitCode::SUCCESS)
+                }
+            },
             Some(AuthCommand::Hint) => commands::auth::hint().map(|_| ExitCode::SUCCESS),
         },
         Some(Command::Renew) => commands::renew::run().map(|_| ExitCode::SUCCESS),
@@ -79,16 +99,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             None => commands::ns::show().map(|_| ExitCode::SUCCESS),
             Some(NsCommand::Show) => commands::ns::show().map(|_| ExitCode::SUCCESS),
             Some(NsCommand::List) => commands::ns::list().map(|_| ExitCode::SUCCESS),
-            Some(NsCommand::Set { name }) => commands::ns::set(name).map(|_| ExitCode::SUCCESS),
+            Some(NsCommand::Set { name, auth }) => {
+                commands::ns::set(name, auth).map(|_| ExitCode::SUCCESS)
+            }
             Some(NsCommand::Add { name }) => commands::ns::add(name).map(|_| ExitCode::SUCCESS),
             Some(NsCommand::Rm { name }) => commands::ns::rm(name).map(|_| ExitCode::SUCCESS),
             Some(NsCommand::SetShorthand(args)) => {
                 // `vaultpow ns <name> [...]` — first arg is the namespace.
+                // The shorthand doesn't surface flags (clap's external_subcommand
+                // takes args verbatim); users who want `--auth <name>` should
+                // call the explicit `vaultpow ns set <name> --auth <name>`.
                 let name = args
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("ns: missing namespace name"))?;
-                commands::ns::set(name).map(|_| ExitCode::SUCCESS)
+                commands::ns::set(name, None).map(|_| ExitCode::SUCCESS)
             }
         },
 

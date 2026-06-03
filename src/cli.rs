@@ -217,9 +217,23 @@ pub enum NsCommand {
     /// Select a namespace for the current cluster (local config change).
     ///
     /// You can also omit the `set` keyword: `vaultpow ns admin/team-a`.
+    ///
+    /// If the cluster's current auth doesn't support the requested
+    /// namespace (its `namespaces` allowlist is non-empty and doesn't
+    /// include this one), vaultpow prompts you to pick an auth that
+    /// does. Use `--auth <name>` to bypass the prompt in scripts; the
+    /// named auth must already support the namespace (vaultpow won't
+    /// auto-extend its scope from a `ns` command — run
+    /// `vaultpow auth ns add <ns>` explicitly if that's what you want).
     Set {
         /// Namespace path (e.g. "admin/team-a"). Use empty string for root.
         name: String,
+
+        /// Bypass the interactive auth-picker by naming the auth to
+        /// switch to (in addition to switching namespace). The named
+        /// auth must already support the namespace.
+        #[arg(long)]
+        auth: Option<String>,
     },
 
     /// Create a namespace on the server (Vault Enterprise only).
@@ -267,6 +281,8 @@ pub enum AuthCommand {
     ///     vaultpow auth add --name admin --method oidc --role admin --non-interactive
     ///     vaultpow auth add --name ro --method userpass --username alice
     ///     vaultpow auth add --name google --method oidc --path google --role admin
+    ///     vaultpow auth add --name admin --method oidc --role admin \
+    ///         --namespace admin/team-a --namespace admin/shared --non-interactive
     Add {
         /// Name for this auth profile (defaults to the method if omitted).
         #[arg(long)]
@@ -293,6 +309,16 @@ pub enum AuthCommand {
         #[arg(long)]
         username: Option<String>,
 
+        /// Namespace this auth is valid for. Repeat to allow multiple.
+        ///
+        /// When set, `vaultpow ns <name>` will only let this auth be used
+        /// for the listed namespaces; switching to another namespace will
+        /// prompt to also switch auth. Omit entirely to leave the auth
+        /// *unscoped* (works across any namespace) — same as auths created
+        /// before this field existed.
+        #[arg(long = "namespace")]
+        namespaces: Vec<String>,
+
         /// Skip interactive prompts; error out if any required field is missing.
         #[arg(long, default_value_t = false)]
         non_interactive: bool,
@@ -307,6 +333,20 @@ pub enum AuthCommand {
     #[command(visible_aliases = ["remove", "delete"])]
     Rm { name: String },
 
+    /// Manage namespaces the *current auth* is allowed to be used for.
+    ///
+    /// This is the per-auth allowlist that `vaultpow ns <name>` consults
+    /// when deciding whether to also switch auth. With no subcommand,
+    /// prints the list (same as `auth ns list`).
+    ///
+    /// Don't confuse this with the cluster-level `vaultpow ns` which
+    /// switches the *active* namespace (and may server-create/delete
+    /// Enterprise namespaces).
+    Ns {
+        #[command(subcommand)]
+        action: Option<AuthNsCommand>,
+    },
+
     /// (Internal) Print a one-line hint about *other* auths configured on
     /// the current cluster. Used by the shell wrapper after a wrapped
     /// command fails with `ok` token state — the common cause is the user
@@ -315,4 +355,27 @@ pub enum AuthCommand {
     /// Exits 0 with no output unless the cluster has 2+ auths.
     #[command(hide = true)]
     Hint,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthNsCommand {
+    /// List namespaces the current auth is allowed to be used for.
+    /// `(unscoped)` means the auth has no restriction — it matches any
+    /// namespace.
+    #[command(visible_alias = "ls")]
+    List,
+
+    /// Add a namespace to the current auth's allowlist.
+    ///
+    /// If the auth was previously *unscoped* (empty list), this is the
+    /// first restriction — the auth will now only be picked for the
+    /// namespaces you explicitly add.
+    Add { name: String },
+
+    /// Remove a namespace from the current auth's allowlist.
+    ///
+    /// If the list becomes empty, the auth reverts to *unscoped*
+    /// (matches any namespace), same as freshly-migrated auths.
+    #[command(visible_aliases = ["remove", "delete"])]
+    Rm { name: String },
 }

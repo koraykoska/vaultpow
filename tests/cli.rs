@@ -721,6 +721,242 @@ fn auth_add_non_interactive_passing_path_role_works_and_persists_params() {
     );
 }
 
+// ── Per-auth namespaces (v0.1.2) ────────────────────────────────────────
+
+fn write_auths_with_namespaces(f: &CliFixture) {
+    // Cluster with two auths: 'admin' scoped to admin/team-a + admin/shared,
+    // 'ro' scoped to admin/public, 'wild' unscoped (matches anything).
+    let yaml = r#"clusters:
+- name: prod
+  server: http://127.0.0.1:8200
+  auths:
+    - name: admin
+      method: oidc
+      namespaces:
+        - admin/team-a
+        - admin/shared
+      token: hvs.admin
+    - name: ro
+      method: userpass
+      namespaces:
+        - admin/public
+      token: hvs.ro
+    - name: wild
+      method: token
+      token: hvs.wild
+  current_auth: admin
+  namespace: admin/team-a
+current_cluster: prod
+"#;
+    std::fs::write(&f.config_path, yaml).unwrap();
+}
+
+#[test]
+fn ns_set_to_already_supported_namespace_does_not_switch_auth() {
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    // admin/shared is in admin's allowlist → no auth change.
+    let out = assert_success(f.cmd().args(["ns", "set", "admin/shared"]));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("set to 'admin/shared'"), "stdout: {stdout}");
+    assert!(
+        !stdout.contains("auth switched"),
+        "auth should not have switched: {stdout}"
+    );
+    let yaml = std::fs::read_to_string(&f.config_path).unwrap();
+    assert!(yaml.contains("current_auth: admin"), "got: {yaml}");
+}
+
+#[test]
+fn ns_set_with_auth_flag_switches_both() {
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    // Explicit --auth to switch to 'ro' for admin/public.
+    let out = assert_success(f.cmd().args(["ns", "set", "admin/public", "--auth", "ro"]));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("auth switched to 'ro'"), "stdout: {stdout}");
+    let yaml = std::fs::read_to_string(&f.config_path).unwrap();
+    assert!(yaml.contains("current_auth: ro"), "got: {yaml}");
+    assert!(yaml.contains("namespace: admin/public"), "got: {yaml}");
+}
+
+#[test]
+fn ns_set_with_auth_flag_errors_when_auth_lacks_namespace() {
+    // --auth must NOT auto-extend the auth's allowlist; surface the
+    // mismatch clearly so the user can decide whether to broaden the
+    // auth (`auth ns add`) or pick a different one.
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    let out = f
+        .cmd()
+        .args(["ns", "set", "admin/team-b", "--auth", "ro"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("does not support namespace"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("auth ns add"), "should hint: {stderr}");
+}
+
+#[test]
+fn ns_set_with_unknown_auth_errors_with_helpful_message() {
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    let out = f
+        .cmd()
+        .args(["ns", "set", "admin/team-a", "--auth", "ghost"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not found"), "stderr: {stderr}");
+}
+
+#[test]
+fn ns_set_errors_when_no_auth_supports_namespace() {
+    // None of the configured auths claim admin/team-b — the user has
+    // to either broaden one (`auth ns add`) or add a new one. Surface
+    // both options.
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    // Switch wild → still unscoped → supports anything. So we must
+    // remove 'wild' first to set up the failing case.
+    assert_success(f.cmd().args(["auth", "rm", "wild"]));
+    let out = f
+        .cmd()
+        .args(["ns", "set", "admin/team-b"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no auth"), "stderr: {stderr}");
+    assert!(stderr.contains("auth ns add"), "should hint: {stderr}");
+    assert!(
+        stderr.contains("auth add --namespace"),
+        "should hint: {stderr}"
+    );
+}
+
+#[test]
+fn ns_set_with_no_auths_configured_just_sets_namespace() {
+    // Pre-multi-auth UX preserved: a fresh cluster with no auths
+    // shouldn't refuse `ns set`. There's no scope to violate.
+    let f = CliFixture::new();
+    assert_success(f.cmd().args([
+        "add-cluster",
+        "--name",
+        "fresh",
+        "--server",
+        "http://x",
+        "--non-interactive",
+    ]));
+    assert_success(f.cmd().args(["ns", "set", "admin/whatever"]));
+    let yaml = std::fs::read_to_string(&f.config_path).unwrap();
+    assert!(yaml.contains("namespace: admin/whatever"), "got: {yaml}");
+}
+
+#[test]
+fn auth_ns_list_shows_unscoped_or_namespaces() {
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    let out = assert_success(f.cmd().args(["auth", "ns", "list"]));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("admin/team-a"), "got: {stdout}");
+    assert!(stdout.contains("admin/shared"), "got: {stdout}");
+
+    // Switch to wild → unscoped → list should say so explicitly.
+    assert_success(f.cmd().args(["auth", "use", "wild"]));
+    let out = assert_success(f.cmd().args(["auth", "ns", "list"]));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("unscoped"), "got: {stdout}");
+}
+
+#[test]
+fn auth_ns_add_then_rm_round_trips() {
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    // Add admin/team-b to current auth (admin)
+    assert_success(f.cmd().args(["auth", "ns", "add", "admin/team-b"]));
+    let yaml = std::fs::read_to_string(&f.config_path).unwrap();
+    assert!(yaml.contains("admin/team-b"), "got: {yaml}");
+    // Now ns set should be a no-auth-switch:
+    let out = assert_success(f.cmd().args(["ns", "set", "admin/team-b"]));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(!s.contains("auth switched"), "got: {s}");
+
+    // Remove it again. Note that `ns set admin/team-b` above also set
+    // the *cluster*'s namespace pointer to admin/team-b, so the string
+    // still appears under `namespace:`. What we care about here is that
+    // it's gone from admin's *allowlist*.
+    assert_success(f.cmd().args(["auth", "ns", "rm", "admin/team-b"]));
+    let out = assert_success(f.cmd().args(["auth", "ns", "list"]));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !s.contains("admin/team-b"),
+        "auth's allowlist should no longer contain it: {s}"
+    );
+}
+
+#[test]
+fn auth_ns_add_idempotent_on_duplicate() {
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    let out = assert_success(f.cmd().args(["auth", "ns", "add", "admin/team-a"]));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("already supports"), "got: {s}");
+}
+
+#[test]
+fn auth_ns_rm_to_empty_reverts_to_unscoped() {
+    // Removing the last namespace flips the auth back to unscoped.
+    // Surface that so the user knows their security posture changed.
+    let f = CliFixture::new();
+    let yaml = r#"clusters:
+- name: c
+  server: http://x
+  auths:
+    - name: only-a
+      namespaces:
+        - admin/a
+      token: hvs.x
+  current_auth: only-a
+current_cluster: c
+"#;
+    std::fs::write(&f.config_path, yaml).unwrap();
+    let out = assert_success(f.cmd().args(["auth", "ns", "rm", "admin/a"]));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains("unscoped"),
+        "should warn about scope change: {s}"
+    );
+}
+
+#[test]
+fn auth_ns_rm_unknown_errors() {
+    let f = CliFixture::new();
+    write_auths_with_namespaces(&f);
+    let out = f
+        .cmd()
+        .args(["auth", "ns", "rm", "admin/never"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("does not list"), "stderr: {stderr}");
+}
+
+#[test]
+fn auth_add_namespace_flag_appears_in_help() {
+    let f = CliFixture::new();
+    let out = assert_success(f.cmd().args(["auth", "add", "--help"]));
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("--namespace"), "got: {s}");
+    assert!(s.contains("unscoped"), "got: {s}");
+}
+
 #[test]
 fn auth_add_path_appears_in_help() {
     // Smoke check that --path is exposed on the CLI surface.

@@ -41,13 +41,18 @@ pub fn run() -> Result<()> {
             let pairs: Vec<String> = a.params.iter().map(|(k, v)| format!("{k}={v}")).collect();
             format!(" [{}]", pairs.join(", "))
         };
+        let namespaces = if a.namespaces.is_empty() {
+            " ns=(unscoped)".to_string()
+        } else {
+            format!(" ns=[{}]", a.namespaces.join(", "))
+        };
         let token_marker = if a.token.as_deref().filter(|t| !t.is_empty()).is_some() {
             ""
         } else {
             " (no token yet)"
         };
         println!(
-            "    {marker} {name}  method={method}{params}{token_marker}",
+            "    {marker} {name}  method={method}{params}{namespaces}{token_marker}",
             name = a.name
         );
     }

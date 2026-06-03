@@ -42,7 +42,7 @@ pub fn refresh(method_override: Option<String>) -> Result<()> {
             crate::commands::info(format!(
                 "no auths configured for '{cluster_name}' — adding one now"
             ));
-            return add(None, method_override, None, None, None, false);
+            return add(None, method_override, None, None, None, vec![], false);
         }
         return Err(anyhow!(
             "no current auth selected for '{cluster_name}'.\n\nAvailable: {}\nPick one with `vaultpow auth use <name>` or add a new one with\n`vaultpow auth add`.",
@@ -105,6 +105,11 @@ pub fn list() -> Result<()> {
             let pairs: Vec<String> = a.params.iter().map(|(k, v)| format!("{k}={v}")).collect();
             format!(" [{}]", pairs.join(", "))
         };
+        let namespaces = if a.namespaces.is_empty() {
+            " ns=(unscoped)".to_string()
+        } else {
+            format!(" ns=[{}]", a.namespaces.join(", "))
+        };
         let token_marker = match a.token.as_deref().filter(|t| !t.is_empty()) {
             Some(_) => match a.expire_time.as_deref() {
                 Some(et) => format!("  (token, expires {et})"),
@@ -113,7 +118,7 @@ pub fn list() -> Result<()> {
             None => "  (no token)".into(),
         };
         println!(
-            "  {marker} {name}  method={method}{params}{token_marker}",
+            "  {marker} {name}  method={method}{params}{namespaces}{token_marker}",
             name = a.name
         );
     }
@@ -149,12 +154,14 @@ pub fn use_auth(name: String) -> Result<()> {
 ///
 /// Interactive by default; pass `--non-interactive` plus the relevant flags
 /// to skip prompts. Always sets the new auth as `current_auth`.
+#[allow(clippy::too_many_arguments)]
 pub fn add(
     name: Option<String>,
     method: Option<String>,
     path: Option<String>,
     role: Option<String>,
     username: Option<String>,
+    namespaces: Vec<String>,
     non_interactive: bool,
 ) -> Result<()> {
     let mut cfg = config::load()?;
@@ -193,6 +200,9 @@ pub fn add(
     let mut stub = Auth {
         name: name.clone(),
         method: Some(method.clone()),
+        // De-dup, drop blanks, preserve insertion order. Repeated --namespace
+        // flags or interactive comma-input both flow through here.
+        namespaces: dedup_namespaces(namespaces),
         ..Default::default()
     };
     if let Some(p) = path.clone().filter(|p| !p.is_empty()) {
@@ -212,6 +222,13 @@ pub fn add(
     // server-side defaults.
     if !non_interactive {
         prompt_method_params(&method, &mut stub.params)?;
+        // Also prompt for the namespaces allowlist if the user didn't pass
+        // any --namespace flags. Default suggestion = the cluster's current
+        // namespace (since that's almost always what they want), or blank
+        // (= unscoped) for clusters that haven't picked one yet.
+        if stub.namespaces.is_empty() {
+            prompt_namespaces(&cluster_snap, &mut stub.namespaces)?;
+        }
     }
 
     if matches!(method.as_str(), "oidc" | "userpass") && non_interactive {
@@ -523,6 +540,171 @@ fn print_auth_stored(cluster_name: &str, a: &Auth) {
         }
         None => println!("stored token for '{cluster_name}' auth '{auth_name}'"),
     }
+}
+
+// ── Per-auth namespace management (auth ns ...) ─────────────────────────
+
+/// `vaultpow auth ns` / `auth ns list` — show the current auth's allowlist.
+pub fn ns_list() -> Result<()> {
+    let mut cfg = config::load()?;
+    let cluster_name = resolve_current(&mut cfg)?;
+    let cluster = cfg.cluster(&cluster_name).unwrap();
+    let auth = current_auth_or_error(cluster, &cluster_name)?;
+
+    println!("auth '{}' (on cluster '{cluster_name}'):", auth.name);
+    if auth.namespaces.is_empty() {
+        println!("  (unscoped — matches any namespace)");
+        println!("\nAdd a namespace with `vaultpow auth ns add <name>` to constrain this auth.");
+    } else {
+        for ns in &auth.namespaces {
+            println!("  {ns}");
+        }
+    }
+    Ok(())
+}
+
+/// `vaultpow auth ns add <name>` — append `<name>` to the current auth's
+/// allowlist. No-op (still succeeds) if it's already present, so the call
+/// is idempotent. If the auth was previously *unscoped* (empty list), this
+/// flips it into scoped mode — subsequent `vaultpow ns` calls will start
+/// enforcing the allowlist for it.
+pub fn ns_add(name: String) -> Result<()> {
+    let trimmed = name.trim().to_string();
+    if trimmed.is_empty() {
+        return Err(anyhow!("namespace name cannot be empty"));
+    }
+    let mut cfg = config::load()?;
+    let cluster_name = resolve_current(&mut cfg)?;
+    let auth_name = current_auth_name_or_error(cfg.cluster(&cluster_name).unwrap(), &cluster_name)?;
+
+    let was_unscoped;
+    let already_present;
+    {
+        let auth = cfg
+            .cluster_mut(&cluster_name)
+            .unwrap()
+            .auth_mut(&auth_name)
+            .unwrap();
+        was_unscoped = auth.namespaces.is_empty();
+        already_present = auth.namespaces.iter().any(|n| n == &trimmed);
+        if !already_present {
+            auth.namespaces.push(trimmed.clone());
+        }
+    }
+    config::save(&cfg)?;
+
+    if already_present {
+        println!("auth '{auth_name}' already supports '{trimmed}' — no change");
+    } else if was_unscoped {
+        println!(
+            "auth '{auth_name}' is now scoped to only '{trimmed}'.\n\nAdd more with further `vaultpow auth ns add <name>` calls, or\nremove this one with `vaultpow auth ns rm {trimmed}` to revert to unscoped."
+        );
+    } else {
+        println!("added '{trimmed}' to auth '{auth_name}'");
+    }
+    Ok(())
+}
+
+/// `vaultpow auth ns rm <name>` — remove `<name>` from the current auth's
+/// allowlist. If the resulting list is empty, the auth flips back to
+/// *unscoped* (matches any namespace) — message that out so the user
+/// isn't surprised.
+pub fn ns_rm(name: String) -> Result<()> {
+    let mut cfg = config::load()?;
+    let cluster_name = resolve_current(&mut cfg)?;
+    let auth_name = current_auth_name_or_error(cfg.cluster(&cluster_name).unwrap(), &cluster_name)?;
+
+    let now_unscoped;
+    let removed;
+    {
+        let auth = cfg
+            .cluster_mut(&cluster_name)
+            .unwrap()
+            .auth_mut(&auth_name)
+            .unwrap();
+        let before = auth.namespaces.len();
+        auth.namespaces.retain(|n| n != &name);
+        removed = auth.namespaces.len() < before;
+        now_unscoped = auth.namespaces.is_empty();
+    }
+    if !removed {
+        return Err(anyhow!(
+            "auth '{auth_name}' does not list '{name}' — nothing to remove"
+        ));
+    }
+    config::save(&cfg)?;
+
+    println!("removed '{name}' from auth '{auth_name}'");
+    if now_unscoped {
+        println!(
+            "\nauth '{auth_name}' is now *unscoped* again — it will match any namespace.\nUse `vaultpow auth ns add <name>` to constrain it."
+        );
+    }
+    Ok(())
+}
+
+fn current_auth_or_error<'a>(cluster: &'a config::Cluster, cluster_name: &str) -> Result<&'a Auth> {
+    cluster.current_auth().ok_or_else(|| {
+        anyhow!(
+            "no current auth on '{cluster_name}'.\n\nRun `vaultpow auth use <name>` or `vaultpow auth add`."
+        )
+    })
+}
+
+fn current_auth_name_or_error(cluster: &config::Cluster, cluster_name: &str) -> Result<String> {
+    current_auth_or_error(cluster, cluster_name).map(|a| a.name.clone())
+}
+
+/// Normalise a `Vec<String>` of namespaces: drop blanks, trim whitespace,
+/// deduplicate (case-sensitive — Vault treats namespace names as
+/// case-sensitive paths). Order is preserved on first occurrence.
+fn dedup_namespaces(input: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(input.len());
+    for raw in input {
+        let s = raw.trim().to_string();
+        if s.is_empty() {
+            continue;
+        }
+        if seen.insert(s.clone()) {
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Interactive prompt for the namespaces allowlist. Accepts a comma- or
+/// whitespace-separated list. Default suggestion is the cluster's current
+/// namespace (most common case: "the auth I'm creating is for the
+/// namespace I'm in"). Blank input keeps the auth unscoped.
+fn prompt_namespaces(cluster: &config::Cluster, out: &mut Vec<String>) -> Result<()> {
+    let default = cluster.namespace.as_deref().unwrap_or("").to_string();
+    let prompt = if default.is_empty() {
+        "Allowed namespaces (comma-separated, blank = unscoped)".to_string()
+    } else {
+        format!("Allowed namespaces (comma-separated, blank = unscoped) [{default}]")
+    };
+    let raw: String = Input::new()
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .interact_text()
+        .map_err(|e| anyhow!("prompt failed: {e}"))?;
+    let raw = raw.trim();
+    let chosen = if raw.is_empty() {
+        // Use the default cluster namespace if the user just hit enter and
+        // one is set; otherwise leave the auth unscoped.
+        if default.is_empty() {
+            vec![]
+        } else {
+            vec![default]
+        }
+    } else {
+        raw.split([',', ' ', '\t'])
+            .map(|s| s.trim().to_string())
+            .collect()
+    };
+    *out = dedup_namespaces(chosen);
+    Ok(())
 }
 
 /// Shell out to `vault login` (or `bao login` if that's what's installed).

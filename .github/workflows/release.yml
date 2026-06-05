@@ -137,24 +137,24 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
 
-  # Bump Formula/vaultpow.rb on main with the new version + sha256s so
+  # Bump Formula/vaultpow.rb on master with the new version + sha256s so
   # `brew upgrade vaultpow` picks up the release. Tag-triggered workflow
-  # is detached, so we explicitly check out main and push there.
+  # is detached, so we explicitly check out master and push there.
   update-formula:
-    name: Bump Homebrew formula on main
+    name: Bump Homebrew formula on master
     needs: release
     runs-on: ubuntu-latest
     permissions:
       # GITHUB_TOKEN with contents:write can push to the same repo. Branch
-      # protection on main may block this — if so, switch to a deploy key
+      # protection on master may block this — if so, switch to a deploy key
       # or PAT, or change to a PR-based flow with peter-evans/create-pull-request.
       contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: master
           # Default token is sufficient for pushing to the same repo when
-          # branch protection isn't enabled on main.
+          # branch protection isn't enabled on master.
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download sha256 sidecars
@@ -193,4 +193,4 @@ jobs:
           git commit -m "release: bump Homebrew formula to v${GITHUB_REF#refs/tags/v}
 
           [skip ci]"
-          git push origin HEAD:main
+          git push origin HEAD:master

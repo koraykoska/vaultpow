@@ -18,7 +18,7 @@
 class Vaultpow < Formula
   desc "kubectx-style context switcher for HashiCorp Vault and OpenBao"
   homepage "https://github.com/koraykoska/vaultpow"
-  version "0.1.0"
+  version "0.1.3"
   license "MIT"
 
   # The trailing `# bump:<asset>` comments mark each sha256 line so the
@@ -29,18 +29,18 @@ class Vaultpow < Formula
   on_macos do
     on_arm do
       url "https://github.com/koraykoska/vaultpow/releases/download/v#{version}/vaultpow-macos-arm64.tar.gz"
-      sha256 "02b4738ea16853557d09d3625024520d65af26be94c97db8215a99c10a601776" # bump:macos-arm64
+      sha256 "fed6e7946cf9b8244d5063451dd3ec6f30d877d2a46d98443e09504dc2194a2a" # bump:macos-arm64
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/koraykoska/vaultpow/releases/download/v#{version}/vaultpow-linux-amd64.tar.gz"
-      sha256 "b5976e774cada48fb0636ff3b27ceae7208d4628e8fde2c6f4c838e877412895" # bump:linux-amd64
+      sha256 "d4bd23f15db0ea2cefd5d0ce9ba1ec3932c376ac1be38ee916eff47ce38c5cf9" # bump:linux-amd64
     end
     on_arm do
       url "https://github.com/koraykoska/vaultpow/releases/download/v#{version}/vaultpow-linux-arm64.tar.gz"
-      sha256 "e69134ebeb29a8655a8e113f71c81d70a164586905b3e7c1502bc2030bf70939" # bump:linux-arm64
+      sha256 "b34e66366bbcced4d794734bc26dd557517a0eb6cca3cb59ce55ae4ff66b0b59" # bump:linux-arm64
     end
   end
 

@@ -154,11 +154,13 @@ Cluster management
                                       non-interactive add
   vaultpow remove-cluster [name]      remove a cluster (interactive if no name)
 
-Namespaces
+Namespaces (cluster-level)
   vaultpow ns                         show selected namespace of current cluster
   vaultpow ns list                    list namespaces from server (Enterprise)
   vaultpow ns <name>                  select namespace for current cluster
-  vaultpow ns set <name>              same as above (explicit form)
+                                      (prompts to also switch auth if the
+                                      current one doesn't support it)
+  vaultpow ns set <name> [--auth <a>] explicit form; --auth bypasses the picker
   vaultpow ns add <name>              create namespace on server (Enterprise)
   vaultpow ns rm <name>               delete namespace on server (Enterprise)
 
@@ -168,10 +170,14 @@ Auth & token lifecycle
   vaultpow auth list                  list named auths (* = current)
   vaultpow auth use <name>            switch current auth (no re-auth)
   vaultpow auth add                   add a new named auth (interactive)
-  vaultpow auth add --name admin --method oidc --role admin --non-interactive
+  vaultpow auth add --name admin --method oidc --path google --role admin \
+      --namespace admin/team-a --namespace admin/shared --non-interactive
                                       add a new named auth (scripted)
   vaultpow auth rm <name>             remove a named auth (never auto-picks
                                       a replacement — you choose explicitly)
+  vaultpow auth ns                    list namespaces the current auth covers
+  vaultpow auth ns add <name>         add a namespace to current auth's allowlist
+  vaultpow auth ns rm <name>          remove one (last one removed = unscoped)
   vaultpow renew                      manually renew the current auth's token
   vaultpow check-token                ok|renewable|expiring|expired|absent|unreachable
 
@@ -194,21 +200,30 @@ Run `vaultpow <command> --help` for full help on any command.
 A single Vault/OpenBao cluster often hosts several identities you want to keep handy — for example an `admin` OIDC role for `admin/team-a` and a `readonly` userpass account for spot-checking secrets. vaultpow gives each cluster an array of *named* auth profiles; the cluster's `current_auth` pointer picks which one `vault`/`bao` calls actually use.
 
 ```bash
-# Create two auths on the current cluster
-vaultpow auth add --name admin --method oidc --role admin --non-interactive
-vaultpow auth add --name ro    --method userpass --username alice --non-interactive
+# Create two auths on the current cluster.
+# --namespace is repeatable; --path overrides the Vault mount path
+# (e.g. when OIDC is mounted at /auth/google/ instead of /auth/oidc/).
+vaultpow auth add --name admin --method oidc \
+  --path google --role admin \
+  --namespace admin/team-a --namespace admin/shared \
+  --non-interactive
+
+vaultpow auth add --name ro --method userpass \
+  --username alice \
+  --namespace admin/public \
+  --non-interactive
 
 # Switch between them — no re-auth, just changes the pointer
 vaultpow auth use ro
-vault kv get secret/public          # uses the ro token
+vault kv get secret/public            # uses the ro token
 vaultpow auth use admin
-vault kv put secret/team-a/key=val  # uses the admin token
+vault kv put secret/team-a/key=val    # uses the admin token
 
 # See what's configured
 vaultpow auth list
 # auths for 'prod':
-#   * admin  method=oidc [role=admin]  (token, expires 2026-05-09T18:34:56Z)
-#     ro     method=userpass [username=alice]  (token cached)
+#   * admin  method=oidc [path=google, role=admin] ns=[admin/team-a, admin/shared]  (token, expires 2026-05-09T18:34:56Z)
+#     ro     method=userpass [username=alice]      ns=[admin/public]                (token cached)
 
 # Remove one. vaultpow NEVER auto-picks a replacement when you remove the
 # current one — even if exactly one auth remains. You always choose:
@@ -218,13 +233,51 @@ vaultpow auth rm admin
 # Available: ro
 ```
 
-Each auth caches its own token, expiry, and renewability separately, so switching is instant. Method-specific parameters (OIDC role, userpass username, …) are stored alongside the auth so refreshes (`vaultpow auth`) don't re-prompt.
+Each auth caches its own token, expiry, renewability, **and the namespaces it's valid for**, separately. Switching is instant — no re-auth, no browser dance. Method-specific parameters (OIDC role/mount path, userpass username, …) are stored alongside the auth so refreshes (`vaultpow auth`) don't re-prompt.
+
+### Custom OIDC/userpass mount paths
+
+When your operator mounts OIDC at `auth/google/` (or userpass at `auth/corp-ldap/`, etc.) instead of the Vault default `auth/oidc/`, pass `--path <mount>` on `auth add`. The interactive flow also prompts for it — leave blank to use Vault's default. The mount path is stored under `params.path` and reused on every refresh.
+
+### Per-auth namespaces and switching
+
+Vault tokens are typically scoped to a single namespace (or a small set). vaultpow tracks this per-auth via a `namespaces` allowlist on each auth profile. The interaction with `vaultpow ns <name>` is what makes multi-auth feel right:
+
+```bash
+# State: auth=admin supports admin/team-a + admin/shared; auth=ro supports admin/public.
+# Current: auth=admin, namespace=admin/team-a.
+
+vaultpow ns admin/shared
+# → admin already supports it, just switches namespace silently.
+
+vaultpow ns admin/public
+# vaultpow: current auth doesn't support namespace 'admin/public'. Pick an auth that does:
+#  > ro [admin/public]
+# (Select with arrow keys + enter; ro becomes current_auth atomically with the ns switch.)
+
+# Scripted form — bypass the picker by naming the auth:
+vaultpow ns admin/public --auth ro
+# namespace for 'prod' set to 'admin/public', auth switched to 'ro'
+```
+
+vaultpow **never auto-extends** an auth's scope from a `ns` command. If you ask for a namespace the named auth doesn't cover, you get a clear error pointing at `vaultpow auth ns add <ns>` (broaden) or `vaultpow auth add --namespace <ns>` (create a new auth scoped to it). If no auth covers the requested namespace at all, the error spells out both options.
+
+An auth with an empty `namespaces` list is *unscoped* — it matches anything. That's the default for fresh auths and for configs from vaultpow ≤ 0.1.1, so adding the field is opt-in: until you start tagging auths, behaviour is identical to before.
+
+```bash
+# Manage the current auth's allowlist
+vaultpow auth ns                       # list (or `auth ns list`)
+vaultpow auth ns add admin/team-b      # append
+vaultpow auth ns rm admin/team-b       # remove
+# Removing the last entry flips the auth back to unscoped; vaultpow surfaces this
+# explicitly so the security posture change is visible.
+```
 
 ### Failure hint
 
 If a wrapped `vault`/`bao` command fails *with a valid token* and the cluster has more than one auth configured, the shell hook prints a short tip pointing at the alternatives:
 
-```
+```text
 $ vault kv get secret/admin-only
 Error: 403 Forbidden — permission denied
 vaultpow: tip: other auths on 'prod': ro, oncall. Try `vaultpow auth use <name>` if this is a permissions issue.
@@ -235,6 +288,8 @@ The tip is silent in single-auth setups, so it doesn't clutter the common case.
 ### Migrating from vaultpow ≤ 0.1.x
 
 vaultpow ≤ 0.1.x kept one unnamed auth per cluster under an `auth:` key. The new schema is fully backward-compatible: on first read, the legacy block is converted in-memory to a named `default` auth (`current_auth: default`). The next time anything writes the config (e.g. `vaultpow ctx <name>`), it's persisted in the new shape. No manual editing required.
+
+The `namespaces` field on each auth is *additive* and defaults to empty (= unscoped) — your existing auths continue to work across every namespace until you opt into tagging them.
 
 ## How token renewal works
 
@@ -259,12 +314,17 @@ Renewal is silent on the happy path. You'll only see vaultpow messages when some
 clusters:
   - name: prod
     server: https://vault-prod.example.com:8200
-    namespace: admin/team-a
+    namespace: admin/team-a               # currently selected namespace
+    current_auth: admin                   # currently selected auth profile
     auths:
       - name: admin
         method: oidc
         params:
+          path: google                    # OIDC mounted at /auth/google/ (not the default /auth/oidc/)
           role: admin
+        namespaces:                       # this auth is valid for these namespaces
+          - admin/team-a
+          - admin/shared
         token: hvs.xxxxxxxxxxxxxxxx
         expire_time: "2026-05-09T18:34:56Z"
         creation_time: 1715269200
@@ -274,8 +334,13 @@ clusters:
         method: userpass
         params:
           username: alice
+        namespaces:
+          - admin/public
         token: hvs.yyyyyyyyyyyyyyyy
-    current_auth: admin
+      - name: wild
+        method: token
+        # no `namespaces:` field = unscoped (matches any namespace)
+        token: hvs.zzzzzzzzzzzzzzzz
   - name: staging
     server: https://vault-staging.example.com:8200
 current_cluster: prod

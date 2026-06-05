@@ -404,6 +404,31 @@ fn run_method(method: &str, cluster: &Cluster, auth: &Auth) -> Result<String> {
     }
 }
 
+/// Prompt for one optional param, skipping if it's already set (e.g. the
+/// user passed it via flag). Trims whitespace; a blank response leaves the
+/// key absent. Factored out of `prompt_method_params` so each match arm
+/// stays a flat sequence of helper calls — also dodges the
+/// `clippy::collapsible_match` lint that fires on single-`if` arms.
+fn prompt_optional_param(
+    params: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+    prompt: &str,
+) -> Result<()> {
+    if params.contains_key(key) {
+        return Ok(());
+    }
+    let val: String = Input::new()
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .interact_text()
+        .map_err(|e| anyhow!("prompt failed: {e}"))?;
+    let trimmed = val.trim();
+    if !trimmed.is_empty() {
+        params.insert(key.into(), trimmed.to_string());
+    }
+    Ok(())
+}
+
 /// Interactive prompts for method-specific params that haven't been provided
 /// via flags. Only prompts for things that meaningfully differ between
 /// installs (custom mount path, OIDC role); username is left to run_method
@@ -414,38 +439,15 @@ fn prompt_method_params(
 ) -> Result<()> {
     match method {
         "oidc" => {
-            if !params.contains_key("path") {
-                let p: String = Input::new()
-                    .with_prompt("OIDC mount path (blank = default `oidc`)")
-                    .allow_empty(true)
-                    .interact_text()
-                    .map_err(|e| anyhow!("prompt failed: {e}"))?;
-                if !p.trim().is_empty() {
-                    params.insert("path".into(), p.trim().to_string());
-                }
-            }
-            if !params.contains_key("role") {
-                let r: String = Input::new()
-                    .with_prompt("OIDC role (blank = server default)")
-                    .allow_empty(true)
-                    .interact_text()
-                    .map_err(|e| anyhow!("prompt failed: {e}"))?;
-                if !r.trim().is_empty() {
-                    params.insert("role".into(), r.trim().to_string());
-                }
-            }
+            prompt_optional_param(params, "path", "OIDC mount path (blank = default `oidc`)")?;
+            prompt_optional_param(params, "role", "OIDC role (blank = server default)")?;
         }
         "userpass" => {
-            if !params.contains_key("path") {
-                let p: String = Input::new()
-                    .with_prompt("userpass mount path (blank = default `userpass`)")
-                    .allow_empty(true)
-                    .interact_text()
-                    .map_err(|e| anyhow!("prompt failed: {e}"))?;
-                if !p.trim().is_empty() {
-                    params.insert("path".into(), p.trim().to_string());
-                }
-            }
+            prompt_optional_param(
+                params,
+                "path",
+                "userpass mount path (blank = default `userpass`)",
+            )?;
             // Username + password are prompted together inside `run_method`
             // since they pair naturally and the password isn't stored anyway.
         }

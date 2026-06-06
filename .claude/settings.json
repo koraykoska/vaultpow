@@ -1,0 +1,6 @@
+{
+  "_comment": "INSECURE BY DESIGN. This repo is synced to an isolated server where Claude Code runs without a human at the keyboard, so every tool call is auto-approved. The SessionEnd hook auto-commits and pushes any changes when Claude finishes. Do NOT enable this on a workstation you care about.",
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  }
+}

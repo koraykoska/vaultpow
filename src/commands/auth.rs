@@ -332,12 +332,73 @@ pub fn rm(name: String) -> Result<()> {
 
 // ── Internals ───────────────────────────────────────────────────────────
 
+/// Decide which namespace to authenticate against. Vault/OpenBao OIDC and
+/// userpass roles live *inside* a namespace, so the namespace sent at login
+/// time has to be the one where the role is defined — which isn't always the
+/// cluster's currently-selected working namespace.
+///
+/// Resolution order:
+///   1. Scoped auth (non-empty `namespaces`): if the cluster's selected
+///      namespace is one this auth covers, use it (honours the user's current
+///      context, e.g. a child namespace). Otherwise use the auth's first
+///      listed namespace — the one it was created for.
+///   2. Unscoped auth (empty `namespaces`): fall back to the cluster's
+///      selected namespace, preserving pre-0.1.4 behaviour exactly.
+///
+/// A blank namespace string is treated as "no namespace" (root).
+fn login_namespace<'a>(cluster: &'a Cluster, auth: &'a Auth) -> Option<&'a str> {
+    let selected = cluster.namespace.as_deref().filter(|n| !n.is_empty());
+    if auth.namespaces.is_empty() {
+        return selected;
+    }
+    match selected {
+        Some(ns) if auth.namespaces.iter().any(|n| n == ns) => Some(ns),
+        _ => auth.namespaces.first().map(String::as_str),
+    }
+}
+
+/// Turn Vault/OpenBao's terse "role could not be found" login failure into a
+/// message that names the namespace we authenticated against and points at
+/// the fix. This error almost always means a namespace mismatch — the role
+/// exists, just not in the namespace we logged in to — so the raw error is
+/// actively misleading without this context.
+fn hint_role_namespace(err: anyhow::Error, used: Option<&str>, auth: &Auth) -> anyhow::Error {
+    if !err.to_string().contains("could not be found") {
+        return err;
+    }
+    let where_ = match used {
+        Some(ns) => format!("namespace '{ns}'"),
+        None => "the root namespace".to_string(),
+    };
+    let mut hint = format!(
+        "\n\nhint: authenticated against {where_}, but the role/mount isn't defined there — \
+         Vault/OpenBao roles live inside a specific namespace."
+    );
+    if auth.namespaces.is_empty() {
+        hint.push_str(
+            " This auth isn't scoped to a namespace, so login used the cluster's selected one \
+             (or root). Tag it with `vaultpow auth ns add <namespace>`, or select the right \
+             namespace first with `vaultpow ns <namespace>`, then retry.",
+        );
+    } else {
+        hint.push_str(&format!(
+            " This auth is scoped to [{}] — confirm the role exists in one of those, or fix the \
+             list with `vaultpow auth ns add/rm <namespace>`.",
+            auth.namespaces.join(", ")
+        ));
+    }
+    anyhow!("{err}{hint}")
+}
+
 /// Drive the chosen auth method end-to-end (interactive prompts as needed)
 /// and return the captured token. Reads `auth.params` for method-specific
 /// parameters (role, username, args).
 fn run_method(method: &str, cluster: &Cluster, auth: &Auth) -> Result<String> {
     let server = cluster.server.as_str();
-    let namespace = cluster.namespace.as_deref();
+    // Authenticate against the namespace where this auth's role actually
+    // lives — not necessarily the cluster's selected working namespace. See
+    // `login_namespace` for the rule.
+    let namespace = login_namespace(cluster, auth);
 
     match method {
         "token" => {
@@ -368,6 +429,7 @@ fn run_method(method: &str, cluster: &Cluster, auth: &Auth) -> Result<String> {
             args.push(format!("password={pass}"));
             let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             run_vault_login(server, namespace, &argv)
+                .map_err(|e| hint_role_namespace(e, namespace, auth))
         }
         "oidc" => {
             let mut args: Vec<String> = vec!["-method=oidc".into(), "-token-only".into()];
@@ -382,6 +444,7 @@ fn run_method(method: &str, cluster: &Cluster, auth: &Auth) -> Result<String> {
             }
             let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             run_vault_login(server, namespace, &argv)
+                .map_err(|e| hint_role_namespace(e, namespace, auth))
         }
         "other" => {
             let raw = match auth.params.get("args") {
@@ -397,6 +460,7 @@ fn run_method(method: &str, cluster: &Cluster, auth: &Auth) -> Result<String> {
             let mut args: Vec<&str> = raw.split_whitespace().collect();
             args.push("-token-only");
             run_vault_login(server, namespace, &args)
+                .map_err(|e| hint_role_namespace(e, namespace, auth))
         }
         other => Err(anyhow!(
             "unknown auth method '{other}' (valid: token, userpass, oidc, other)"
@@ -750,4 +814,99 @@ fn run_vault_login(server: &str, namespace: Option<&str>, args: &[&str]) -> Resu
         return Err(anyhow!("{cli_name} login returned an empty token"));
     }
     Ok(token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cluster_with_ns(ns: Option<&str>) -> Cluster {
+        Cluster {
+            name: "c".into(),
+            server: "https://v".into(),
+            namespace: ns.map(String::from),
+            ..Default::default()
+        }
+    }
+
+    fn auth_with_ns(list: &[&str]) -> Auth {
+        Auth {
+            name: "a".into(),
+            namespaces: list.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn login_namespace_unscoped_auth_uses_cluster_namespace() {
+        let a = auth_with_ns(&[]);
+        assert_eq!(
+            login_namespace(&cluster_with_ns(Some("admin/team-a")), &a),
+            Some("admin/team-a")
+        );
+        // No selected namespace, and a blank one, both mean root.
+        assert_eq!(login_namespace(&cluster_with_ns(None), &a), None);
+        assert_eq!(login_namespace(&cluster_with_ns(Some("")), &a), None);
+    }
+
+    #[test]
+    fn login_namespace_scoped_auth_uses_first_when_cluster_unset() {
+        // The bug this fixes: cluster has no namespace selected, but the OIDC
+        // role lives in the auth's namespace. Log in there, not at root.
+        let a = auth_with_ns(&["ethena-pay-production", "ethena-pay-staging"]);
+        assert_eq!(
+            login_namespace(&cluster_with_ns(None), &a),
+            Some("ethena-pay-production")
+        );
+    }
+
+    #[test]
+    fn login_namespace_scoped_auth_honours_selected_when_covered() {
+        let a = auth_with_ns(&["ethena-pay-production", "ethena-pay-staging"]);
+        assert_eq!(
+            login_namespace(&cluster_with_ns(Some("ethena-pay-staging")), &a),
+            Some("ethena-pay-staging")
+        );
+    }
+
+    #[test]
+    fn login_namespace_scoped_auth_ignores_selected_when_not_covered() {
+        // Selected namespace the auth doesn't cover → use the auth's own first
+        // namespace rather than logging in somewhere the role can't be found.
+        let a = auth_with_ns(&["ethena-pay-production"]);
+        assert_eq!(
+            login_namespace(&cluster_with_ns(Some("some/other")), &a),
+            Some("ethena-pay-production")
+        );
+    }
+
+    #[test]
+    fn hint_role_namespace_only_fires_on_role_not_found() {
+        let a = auth_with_ns(&["ethena-pay-production"]);
+        let unrelated = anyhow!("bao login failed:\nconnection refused");
+        assert!(!hint_role_namespace(unrelated, None, &a)
+            .to_string()
+            .contains("hint:"));
+    }
+
+    #[test]
+    fn hint_role_namespace_names_root_and_scope() {
+        let a = auth_with_ns(&["ethena-pay-production"]);
+        let err = anyhow!("bao login failed:\nrole \"secrets-admin\" could not be found");
+        let out = hint_role_namespace(err, None, &a).to_string();
+        assert!(out.contains("hint:"));
+        assert!(out.contains("root namespace"));
+        assert!(out.contains("ethena-pay-production"));
+        // Original error text is preserved, not replaced.
+        assert!(out.contains("could not be found"));
+    }
+
+    #[test]
+    fn hint_role_namespace_names_used_namespace_for_unscoped_auth() {
+        let a = auth_with_ns(&[]);
+        let err = anyhow!("role \"x\" could not be found");
+        let out = hint_role_namespace(err, Some("ethena-pay-staging"), &a).to_string();
+        assert!(out.contains("namespace 'ethena-pay-staging'"));
+        assert!(out.contains("vaultpow auth ns add"));
+    }
 }

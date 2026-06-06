@@ -273,6 +273,15 @@ vaultpow auth ns rm admin/team-b       # remove
 # explicitly so the security posture change is visible.
 ```
 
+#### Which namespace you authenticate against
+
+Vault/OpenBao OIDC and userpass *roles live inside a namespace*. To fetch a token you must log in against the namespace where the role is defined — which isn't necessarily the cluster's currently-selected working namespace. vaultpow resolves the login namespace like this:
+
+- **Scoped auth** (non-empty `namespaces`): if the cluster's selected namespace is one this auth covers, that one is used (so a child-namespace context is respected); otherwise the auth's **first listed namespace** is used — the one it was created for.
+- **Unscoped auth** (empty `namespaces`): the cluster's selected namespace is used (or root if none) — exactly as before 0.1.4.
+
+The upshot: `vaultpow auth add --method oidc --path <mount> --role <role> --namespace admin/team-a` authenticates against `admin/team-a` straight away, even if no namespace is selected on the cluster yet. If a login still fails with the server's terse `role "<x>" could not be found`, vaultpow appends a hint naming the namespace it tried and pointing at `vaultpow ns <namespace>` / `vaultpow auth ns add <namespace>` — that error nearly always means the role lives in a different namespace than the one logged in to.
+
 ### Failure hint
 
 If a wrapped `vault`/`bao` command fails *with a valid token* and the cluster has more than one auth configured, the shell hook prints a short tip pointing at the alternatives:
